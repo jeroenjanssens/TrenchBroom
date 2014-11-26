@@ -30,27 +30,39 @@
 #include "Renderer/TextAnchor.h"
 #include "Renderer/TextureFont.h"
 
+#include <map>
+
 namespace TrenchBroom {
     namespace Renderer {
         const size_t TextRenderer::RectCornerSegments = 3;
         const float TextRenderer::RectCornerRadius = 3.0f;
         
-        TextRenderer::Entry::Entry(Vec2f::List& i_vertices, const Vec2f& i_size, const Vec3f& i_offset, const Color& i_textColor, const Color& i_backgroundColor) :
-        size(i_size),
-        offset(i_offset),
-        textColor(i_textColor),
-        backgroundColor(i_backgroundColor) {
-            using std::swap;
-            swap(vertices, i_vertices);
-        }
+        struct TextRenderer::Entry {
+            float distance;
+            bool onTop;
+            Vec2f::List vertices;
+            Vec2f size;
+            Vec3f offset;
+            Color textColor;
+            Color backgroundColor;
+            
+            Entry(const float i_distance, const bool i_onTop, Vec2f::List& i_vertices, const Vec2f& i_size, const Vec3f& i_offset, const Color& i_textColor, const Color& i_backgroundColor) :
+            distance(i_distance),
+            onTop(i_onTop),
+            vertices(0),
+            size(i_size),
+            offset(i_offset),
+            textColor(i_textColor),
+            backgroundColor(i_backgroundColor) {
+                using std::swap;
+                swap(vertices, i_vertices);
+            }
+        };
 
-        TextRenderer::EntryCollection::EntryCollection() :
-        textVertexCount(0),
-        rectVertexCount(0) {}
-        
         TextRenderer::TextRenderer(const FontDescriptor& fontDescriptor, const Vec2f& inset) :
         m_fontDescriptor(fontDescriptor),
-        m_inset(inset) {}
+        m_inset(inset),
+        m_fadeOverlapping(true) {}
 
         void TextRenderer::renderString(RenderContext& renderContext, const Color& textColor, const Color& backgroundColor, const AttrString& string, const TextAnchor& position) {
             renderString(renderContext, textColor, backgroundColor, string, position, false);
@@ -61,68 +73,124 @@ namespace TrenchBroom {
         }
 
         void TextRenderer::renderString(RenderContext& renderContext, const Color& textColor, const Color& backgroundColor, const AttrString& string, const TextAnchor& position, const bool onTop) {
-            if (!isVisible(renderContext, string, position))
-                return;
+            const Camera& camera = renderContext.camera();
+            const float distance = camera.perpendicularDistanceTo(position.position());
             
+            if (distance <= 0.0f)
+                return;
+
             FontManager& fontManager = renderContext.fontManager();
             TextureFont& font = fontManager.font(m_fontDescriptor);
+            
+            const Vec2f size = font.measure(string).rounded();
+            const Vec3f offset = position.offset(camera, size);
+            const Vec2f actualSize = size + 2.0f * m_inset;
+
+            const Camera::Viewport& viewport = camera.unzoomedViewport();
+            if (!viewport.contains(offset.x() - m_inset.x(), offset.y() - m_inset.y(), actualSize.x(), actualSize.y()))
+                return;
 
             Vec2f::List vertices = font.quads(string, true);
-            const Vec2f size = font.measure(string);
-            const Vec3f offset = position.offset(renderContext.camera(), size);
+            m_entries.push_back(Entry(distance, onTop, vertices, size, offset, textColor, backgroundColor));
             
-            if (onTop)
-                addEntry(m_entriesOnTop, Entry(vertices, size, offset, textColor, backgroundColor));
-            else
-                addEntry(m_entries, Entry(vertices, size, offset, textColor, backgroundColor));
+            m_fadeOverlapping = renderContext.render3D();
         }
 
-        bool TextRenderer::isVisible(RenderContext& renderContext, const AttrString& string, const TextAnchor& position) const {
-            const Camera& camera = renderContext.camera();
-            const Camera::Viewport& viewport = camera.unzoomedViewport();
-            
-            const Vec2f size = stringSize(renderContext, string);
-            const Vec2f offset = Vec2f(position.offset(camera, size)) - m_inset;
-            const Vec2f actualSize = size + 2.0f * m_inset;
-            
-            return viewport.contains(offset.x(), offset.y(), actualSize.x(), actualSize.y());
-        }
-
-        void TextRenderer::addEntry(EntryCollection& collection, const Entry& entry) {
-            collection.entries.push_back(entry);
-            collection.textVertexCount += entry.vertices.size();
-            collection.rectVertexCount += roundedRect2DVertexCount(RectCornerSegments);
-        }
+        class TextRenderer::CompareEntriesByDistance {
+        public:
+            bool operator()(const Entry& lhs, const Entry& rhs) const {
+                if (lhs.onTop && !rhs.onTop)
+                    return true;
+                if (!lhs.onTop && rhs.onTop)
+                    return false;
+                if (Math::lt(lhs.distance, rhs.distance))
+                    return true;
+                if (Math::gt(lhs.distance, rhs.distance))
+                    return false;
+                if (Math::lt(lhs.offset.x(), rhs.offset.x()))
+                    return true;
+                if (Math::gt(lhs.offset.x(), rhs.offset.x()))
+                    return false;
+                return lhs.offset.y() < rhs.offset.y();
+            }
+        };
         
-        Vec2f TextRenderer::stringSize(RenderContext& renderContext, const AttrString& string) const {
-            FontManager& fontManager = renderContext.fontManager();
-            TextureFont& font = fontManager.font(m_fontDescriptor);
-            return font.measure(string).rounded();
-        }
-
         void TextRenderer::doPrepare(Vbo& vbo) {
-            prepare(m_entries, vbo);
-            prepare(m_entriesOnTop, vbo);
-        }
-        
-        void TextRenderer::prepare(EntryCollection& collection, Vbo& vbo) {
-            TextVertex::List textVertices;
-            textVertices.reserve(collection.textVertexCount);
+            EntryItList entries;
+            EntryItList entriesOnTop;
             
-            RectVertex::List rectVertices;
-            rectVertices.reserve(collection.rectVertexCount);
+            size_t textVertexCount = 0;
+            size_t rectVertexCount = 0;
+            size_t textVertexCountOnTop = 0;
+            size_t rectVertexCountOnTop = 0;
             
-            EntryList::const_iterator it, end;
-            for (it = collection.entries.begin(), end = collection.entries.end(); it != end; ++it) {
-                const Entry& entry = *it;
-                addEntry(entry, textVertices, rectVertices);
+            VectorUtils::sort(m_entries, CompareEntriesByDistance());
+            
+            EntryList::iterator it, cur, end;
+            for (it = m_entries.begin(), end = m_entries.end(); it != end; ++it) {
+                Entry& entry = *it;
+                const BBox2f entryBounds(entry.offset - m_inset, entry.offset + entry.size + m_inset);
+
+                float overlappingArea = 0.0f;
+                cur = m_entries.begin();
+                while (cur != it && overlappingArea <= 0.0f) {
+                    const Entry& other = *cur;
+                    const BBox2f otherBounds(other.offset - m_inset, other.offset + other.size + m_inset);
+                    const BBox2f intersection = entryBounds.intersectedWith(otherBounds);
+                    const Vec2f intersectionSize = intersection.size();
+                    overlappingArea = intersectionSize.x() * intersectionSize.y();
+                    
+                    ++cur;
+                }
+
+                
+                if (overlappingArea > 0.0f) {
+                    const float factor = 1.0f - overlappingArea / 100.0f;
+                    if (m_fadeOverlapping && factor <= 1.0f) {
+                        entry.textColor[3] *= factor;
+                        entry.backgroundColor[3] *= factor;
+                    } else {
+                        continue;
+                    }
+                }
+                
+                if (entry.onTop) {
+                    entriesOnTop.push_back(it);
+                    textVertexCountOnTop += entry.vertices.size();
+                    rectVertexCountOnTop += roundedRect2DVertexCount(RectCornerSegments);
+                } else {
+                    entries.push_back(it);
+                    textVertexCount += entry.vertices.size();
+                    rectVertexCount += roundedRect2DVertexCount(RectCornerSegments);
+                }
             }
             
-            collection.textArray = VertexArray::swap(GL_QUADS, textVertices);
-            collection.rectArray = VertexArray::swap(GL_TRIANGLES, rectVertices);
+            TextVertex::List textVertices, textVerticesOnTop;
+            RectVertex::List rectVertices, rectVerticesOnTop;
+
+            textVertices.reserve(textVertexCount);
+            rectVertices.reserve(rectVertexCount);
+            textVerticesOnTop.reserve(textVertexCountOnTop);
+            rectVerticesOnTop.reserve(rectVertexCountOnTop);
             
-            collection.textArray.prepare(vbo);
-            collection.rectArray.prepare(vbo);
+            buildArrays(entries, textVertices, rectVertices);
+            buildArrays(entriesOnTop, textVerticesOnTop, rectVerticesOnTop);
+            
+            m_textArray = VertexArray::swap(GL_QUADS, textVertices);
+            m_rectArray = VertexArray::swap(GL_TRIANGLES, rectVertices);
+            m_textArrayOnTop = VertexArray::swap(GL_QUADS, textVerticesOnTop);
+            m_rectArrayOnTop = VertexArray::swap(GL_TRIANGLES, rectVerticesOnTop);
+            
+            m_textArray.prepare(vbo);
+            m_rectArray.prepare(vbo);
+            m_textArrayOnTop.prepare(vbo);
+            m_rectArrayOnTop.prepare(vbo);
+        }
+
+        void TextRenderer::buildArrays(const EntryItList& entries, TextVertex::List& textVertices, RectVertex::List& rectVertices) {
+            EntryItList::const_iterator it, end;
+            for (it = entries.begin(), end = entries.end(); it != end; ++it)
+                addEntry(**it, textVertices, rectVertices);
         }
 
         void TextRenderer::addEntry(const Entry& entry, TextVertex::List& textVertices, RectVertex::List& rectVertices) {
@@ -156,28 +224,28 @@ namespace TrenchBroom {
             const Mat4x4f view = viewMatrix(Vec3f::NegZ, Vec3f::PosY);
             ReplaceTransformation ortho(renderContext.transformation(), projection, view);
             
-            render(m_entries, renderContext);
+            render(renderContext, m_textArray, m_rectArray);
             
             glDisable(GL_DEPTH_TEST);
-            render(m_entriesOnTop, renderContext);
+            render(renderContext, m_textArrayOnTop, m_rectArrayOnTop);
             glEnable(GL_DEPTH_TEST);
         }
 
-        void TextRenderer::render(EntryCollection& collection, RenderContext& renderContext) {
+        void TextRenderer::render(RenderContext& renderContext, VertexArray& textArray, VertexArray& rectArray) {
             FontManager& fontManager = renderContext.fontManager();
             TextureFont& font = fontManager.font(m_fontDescriptor);
             
             glDisable(GL_TEXTURE_2D);
             
             ActiveShader backgroundShader(renderContext.shaderManager(), Shaders::TextBackgroundShader);
-            collection.rectArray.render();
+            rectArray.render();
             
             glEnable(GL_TEXTURE_2D);
             
             ActiveShader textShader(renderContext.shaderManager(), Shaders::ColoredTextShader);
             textShader.set("Texture", 0);
             font.activate();
-            collection.textArray.render();
+            textArray.render();
             font.deactivate();
         }
     }

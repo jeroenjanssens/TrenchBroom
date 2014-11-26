@@ -147,12 +147,13 @@ public:
         for (size_t i = 0; i < S; ++i) {
             min[i] = std::max(min[i], right.min[i]);
             max[i] = std::min(max[i], right.max[i]);
+            max[i] = std::max(max[i], min[i]);
         }
         return *this;
     }
     
     const BBox<T,S> intersectedWith(const BBox<T,S>& right) const {
-        return BBox<T,S>(*this).insersectWith(right);
+        return BBox<T,S>(*this).intersectWith(right);
     }
     
     

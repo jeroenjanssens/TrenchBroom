@@ -262,6 +262,11 @@ namespace Math {
         return gt(v, e, epsilon) && lt(v, s, epsilon);
     }
    
+    template <typename T>
+    bool segmentsIntersect(const T min1, const T max1, const T min2, const T max2) {
+        return max1 < min2 || min1 > max2;
+    }
+    
     size_t succ(size_t index, size_t count, size_t offset = 1);
 
     size_t pred(size_t index, size_t count, size_t offset = 1);
